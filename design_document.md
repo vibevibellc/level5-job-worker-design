@@ -43,6 +43,8 @@ The worker runs on 64-bit Linux with cgroup v2.
 
 The worker gets a writable delegated cgroup subtree. The server receives this path with `--cgroup-root`. The worker manages job cgroups inside that root. It does not mount cgroup filesystems, edit systemd config, or do root-level host setup.
 
+The server owns the job working directory. Clients do not choose `cwd`.
+
 Demo CA/server/client certs are checked into the repo for local dev only. They are not production secrets.
 
 ## Architecture
@@ -75,11 +77,11 @@ The server is thin. The worker library owns process state, output state, and cgr
 Each job has:
 
 ```text
-id
+id (opaque UUID string)
 owner identity
 executable path
 args
-cwd
+server-owned working directory
 limits
 state
 pid
@@ -124,7 +126,7 @@ Start flow:
 2. Require absolute executable path.
 3. Reject shell strings and `PATH` lookup.
 4. Validate resource limits.
-5. Create job ID.
+5. Create an opaque UUID job ID.
 6. Create output spool files.
 7. Create job cgroup.
 8. Write cgroup limits.
@@ -146,6 +148,8 @@ SysProcAttr{
 ```
 
 This places the child in the job cgroup at process start. That avoids the fork race from starting a process first and moving its PID to `cgroup.procs` later.
+
+The process working directory is fixed by the server.
 
 If direct cgroup placement is not available, `Start` fails with a clear error. I will not implement PID-after-start migration as the normal path because a process can fork before migration.
 
@@ -222,11 +226,11 @@ stdout.bin
 stderr.bin
 ```
 
-Drain goroutines read process pipes as bytes and append to spool files. Stream clients read from byte offsets. Default offset is zero, so clients see output from the start.
+Drain goroutines read process pipes as bytes and append to spool files. Stream clients always replay from the start of the job output.
 
 New output wakes waiting clients with a condition variable or broadcaster channel. No busy polling.
 
-Multiple clients can stream the same job. Each client has its own offsets.
+Multiple clients can stream the same job. Each client has its own internal read position.
 
 Output chunks are bounded, for example 32 KiB or 64 KiB, to avoid huge gRPC messages.
 
@@ -234,29 +238,19 @@ A hardcoded max spool size prevents disk fill. If reached, the worker keeps drai
 
 If output read/spool fails, the job records `output_error`, waiting stream clients receive a gRPC error, and status remains queryable.
 
-### Follow, EOF, offsets, and ordering
-
-Offsets are per stream:
-
-```text
-stdout_offset = byte offset in stdout.bin
-stderr_offset = byte offset in stderr.bin
-```
+### Follow, EOF, and ordering
 
 Each chunk has:
 
 ```text
 stream = STDOUT or STDERR
-offset = starting byte offset for that stream
 data   = raw bytes
 eof    = true when that stream is closed
 ```
 
 `data` is a protobuf `bytes` field, not a `string`.
 
-Clients update only the offset for the stream they receive.
-
-`follow=false` means replay available bytes from the requested offsets and return. It does not wait for future output. If the job is already done, the server also sends EOF for closed streams.
+`follow=false` means replay available bytes from the start and return. It does not wait for future output. If the job is already done, the server also sends EOF for closed streams.
 
 `follow=true` means replay available bytes, then wait for new bytes. The RPC ends after the job exits, both pipes are drained, and both streams have sent EOF.
 
@@ -332,7 +326,7 @@ Disk I/O uses cgroup v2 `io.max`.
 
 `io.max` is device-based, not path-based. The worker resolves a device for the job:
 
-1. Use the job `cwd`. If unset, use the worker's job work directory.
+1. Use the server-owned job working directory.
 2. Read `/proc/self/mountinfo`.
 3. Find the longest mount point prefix matching the directory.
 4. Use that mount's major:minor device number.
@@ -345,23 +339,103 @@ This is not perfect for every filesystem. `tmpfs`, network filesystems, overlay 
 ## gRPC API
 
 ```proto
+syntax = "proto3";
+
+package worker.v1;
+
 service WorkerService {
   rpc StartJob(StartJobRequest) returns (StartJobResponse);
   rpc StopJob(StopJobRequest) returns (StopJobResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
   rpc StreamOutput(StreamOutputRequest) returns (stream OutputChunk);
 }
+
+message StartJobRequest {
+  string path = 1;
+  repeated string args = 2;
+  ResourceLimits limits = 3;
+}
+
+message StartJobResponse {
+  Job job = 1;
+}
+
+message StopJobRequest {
+  string job_id = 1;
+}
+
+message StopJobResponse {
+  Job job = 1;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message GetJobResponse {
+  Job job = 1;
+}
+
+message StreamOutputRequest {
+  string job_id = 1;
+  bool follow = 2;
+}
+
+message OutputChunk {
+  OutputStream stream = 1;
+  bytes data = 2;
+  bool eof = 3;
+  bool truncated = 4;
+}
+
+message Job {
+  string id = 1;
+  string owner = 2;
+  string path = 3;
+  repeated string args = 4;
+  ResourceLimits limits = 5;
+  JobState state = 6;
+  int32 pid = 7;
+  int32 process_group_id = 8;
+  string cgroup_path = 9;
+  ExitResult exit = 10;
+  bool output_truncated = 11;
+  string output_error = 12;
+}
+
+message ResourceLimits {
+  int64 cpu_millicores = 1;
+  int64 memory_bytes = 2;
+  int64 io_read_bps = 3;
+  int64 io_write_bps = 4;
+}
+
+message ExitResult {
+  int32 exit_code = 1;
+  string signal = 2;
+  string error = 3;
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_STARTING = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_STOPPING = 3;
+  JOB_STATE_EXITED = 4;
+  JOB_STATE_KILLED = 5;
+  JOB_STATE_FAILED = 6;
+}
+
+enum OutputStream {
+  OUTPUT_STREAM_UNSPECIFIED = 0;
+  OUTPUT_STREAM_STDOUT = 1;
+  OUTPUT_STREAM_STDERR = 2;
+}
 ```
 
-Main fields:
+`job_id` is an opaque server-generated UUID string. Clients pass it back unchanged and do not parse meaning from it.
 
-```text
-StartJobRequest: path, args, cwd, cpu_millicores, memory_bytes, io_read_bps, io_write_bps
-StopJobRequest: job_id
-GetJobRequest: job_id
-StreamOutputRequest: job_id, stdout_offset, stderr_offset, follow
-OutputChunk: stream, offset, bytes data, truncated, eof
-```
+`StartJobRequest` does not include `cwd`. The server chooses the working directory.
 
 Skip `ListJobs` for the first version.
 
@@ -417,6 +491,10 @@ runner  start jobs, read own jobs, stop own jobs
 
 Job owner is set from client identity at start time. Unknown URI SANs are rejected.
 
+Authorization is implemented in the gRPC layer. A unary interceptor and stream interceptor extract the verified client certificate from the TLS connection, read its URI SAN identity, map that identity to a role, and attach the authenticated principal to the RPC context. Each handler then checks the requested action against the role policy and, for existing jobs, the job owner before calling the worker library.
+
+`StartJob` requires `runner` or `admin`. `GetJob`, `StopJob`, and `StreamOutput` require either `admin` or a matching job owner.
+
 ## CLI UX
 
 Start server:
@@ -438,7 +516,7 @@ jobctl start --addr 127.0.0.1:8443 \
   --key testdata/certs/runner-key.pem \
   --cpu 500m --memory 128Mi \
   --read-bps 10485760 --write-bps 10485760 \
-  --cwd /tmp -- /usr/bin/echo hello
+  -- /usr/bin/echo hello
 ```
 
 Other commands:
@@ -468,9 +546,9 @@ Demo certs are local-dev fixtures only.
 
 Focus tests on risky parts.
 
-Worker/process tests: valid start, bad path, missing command, stop running job, stop exited job, child process cleanup, exit status, start rollback.
+Worker/process tests: valid start, bad path, missing command, server-owned working directory, stop running job, stop exited job, child process cleanup, exit status, start rollback.
 
-Output tests: replay from start, follow mode, EOF, offsets, multiple clients, stdout/stderr separation, binary data, invalid UTF-8, NUL bytes, cancellation, truncation, stream error.
+Output tests: replay from start, follow mode, EOF, multiple clients, stdout/stderr separation, binary data, invalid UTF-8, NUL bytes, cancellation, truncation, stream error.
 
 TLS/auth tests: valid cert, missing cert, unknown CA, missing URI SAN, unknown URI SAN, unauthorized role, owner checks, admin override.
 
@@ -491,4 +569,3 @@ Run with the race detector.
 3. gRPC, mTLS, authz, CLI.
 4. cgroup v2 limits and process cleanup.
 5. Polish: tests, docs.
-
