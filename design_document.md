@@ -23,7 +23,7 @@ This is a prototype. Keepin' it small. No scheduler. No database. No containers.
 - Start a job.
 - Stop a job.
 - Get job status.
-- Stream stdout/stderr from the start of a job.
+- Stream combined process output from the start of a job.
 - Support many output clients for one job.
 - Process output may be text or arbitrary binary data. Treat all output as raw bytes and preserve it byte-for-byte; never require, assume, decode, or transform it as text.
 - Use gRPC over mTLS.
@@ -41,7 +41,7 @@ Jobs run as the worker service user. Cgroups limit resources. They are not a san
 
 The worker runs on 64-bit Linux with cgroup v2.
 
-The worker gets a writable delegated cgroup subtree. The server receives this path with `--cgroup-root`. The worker manages job cgroups inside that root. It does not mount cgroup filesystems, edit systemd config, or do root-level host setup.
+The worker gets a writable delegated cgroup subtree at `/sys/fs/cgroup/jobworker`. The worker manages job cgroups inside that root. It does not mount cgroup filesystems, edit systemd config, or do root-level host setup.
 
 The server owns the job working directory. Clients do not choose `cwd`.
 
@@ -85,11 +85,10 @@ server-owned working directory
 limits
 state
 pid
-process group id
 cgroup path
 exit result
-output spool paths
-output errors/truncation state
+output spool path
+output error state
 ```
 
 States:
@@ -131,8 +130,8 @@ Start flow:
 7. Create job cgroup.
 8. Write cgroup limits.
 9. Open the job cgroup directory.
-10. Start process in a new process group and directly inside the job cgroup.
-11. Start stdout/stderr drain goroutines.
+10. Start process directly inside the job cgroup.
+11. Start output drain goroutine.
 12. Start wait goroutine.
 13. Mark job `RUNNING`.
 14. Return job ID.
@@ -141,7 +140,6 @@ Primary implementation uses Linux `syscall.SysProcAttr`:
 
 ```go
 SysProcAttr{
-    Setpgid:      true,
     UseCgroupFD:  true,
     CgroupFD:     jobCgroupFD,
 }
@@ -159,13 +157,12 @@ If direct cgroup placement is not available, `Start` fails with a clear error. I
 
 If setup fails after side effects, rollback runs in reverse order:
 
-1. Kill partial process/process group if it started.
-2. Use `cgroup.kill` if the job cgroup has live processes.
-3. Close pipes and spool files.
-4. Delete partial output files.
-5. Remove the job cgroup.
-6. Remove the job from memory.
-7. Return the original error, with cleanup errors attached or logged.
+1. Use `cgroup.kill` if the job cgroup has live processes.
+2. Close pipes and spool files.
+3. Delete partial output files.
+4. Remove the job cgroup.
+5. Remove the job from memory.
+6. Return the original error, with cleanup errors attached or logged.
 
 This prevents orphan processes, leaked cgroups, and leaked output files on failed starts.
 
@@ -178,7 +175,7 @@ The wait goroutine:
 1. Waits for the process to exit.
 2. Records exit code or signal.
 3. Marks state `EXITED`, `KILLED`, or `FAILED`.
-4. Waits for stdout/stderr drain goroutines to finish.
+4. Waits for the output drain goroutine to finish.
 5. Closes output writers.
 6. Records output drain errors, if any.
 7. Sends EOF to stream clients.
@@ -196,37 +193,24 @@ Stop flow:
 2. Check caller is allowed.
 3. If terminal, return current status.
 4. Mark `STOPPING`.
-5. Send `SIGTERM` to the process group.
-6. Wait a short hardcoded grace period.
-7. If still running, write `1` to `cgroup.kill`.
-8. If `cgroup.kill` is unavailable, fall back to `SIGKILL` on the process group.
-9. Let the wait goroutine record final state and clean up.
+5. Write `1` to `cgroup.kill`.
+6. Let the wait goroutine record final state and clean up.
 
-`cgroup.kill` is the authoritative cleanup path for remaining job processes. Process group signaling is still useful for graceful stop and as a fallback.
+`cgroup.kill` is the cleanup path for job processes. Job processes should not have write access to the worker's cgroup filesystem.
 
 Jobs that intentionally escape the cgroup are not supported. The worker does not provide container-grade isolation.
 
 ## Output streaming
 
-Output is opaque binary data.
+Output is opaque binary data. The worker stores and streams bytes as-is.
 
-Rules:
-
-- Do not decode UTF-8.
-- Do not split by lines.
-- Do not trim bytes.
-- Do not add timestamps.
-- Do not add stream labels to raw output.
-- Do not assume newlines, printable bytes, or text encoding.
-
-The worker captures stdout and stderr separately:
+The worker captures stdout and stderr as one combined stream:
 
 ```text
-stdout.bin
-stderr.bin
+output.bin
 ```
 
-Drain goroutines read process pipes as bytes and append to spool files. Stream clients always replay from the start of the job output.
+The process stdout and stderr file descriptors both write to the same pipe. The drain goroutine reads that pipe as bytes and appends to the spool file. This preserves the output ordering seen by the worker instead of separating streams and reordering them later.
 
 New output wakes waiting clients with a condition variable or broadcaster channel. No busy polling.
 
@@ -234,67 +218,55 @@ Multiple clients can stream the same job. Each client has its own internal read 
 
 Output chunks are bounded, for example 32 KiB or 64 KiB, to avoid huge gRPC messages.
 
-A hardcoded max spool size prevents disk fill. If reached, the worker keeps draining pipes but stops saving extra bytes. Job status reports `output_truncated=true`.
-
 If output read/spool fails, the job records `output_error`, waiting stream clients receive a gRPC error, and status remains queryable.
 
-### Follow, EOF, and ordering
+### EOF and ordering
 
 Each chunk has:
 
 ```text
-stream = STDOUT or STDERR
-data   = raw bytes
-eof    = true when that stream is closed
+data = raw bytes
+eof  = true when the process output pipe is closed
 ```
 
 `data` is a protobuf `bytes` field, not a `string`.
 
-`follow=false` means replay available bytes from the start and return. It does not wait for future output. If the job is already done, the server also sends EOF for closed streams.
+`StreamOutput` replays bytes from the start, waits for new bytes while the job is running, and ends after the job exits and the output pipe is drained.
 
-`follow=true` means replay available bytes, then wait for new bytes. The RPC ends after the job exits, both pipes are drained, and both streams have sent EOF.
-
-Ordering is guaranteed within each stream. There is no total ordering between stdout and stderr. They are separate Linux pipes, so cross-stream ordering is best effort only.
-
-CLI writes job stdout bytes to local stdout and job stderr bytes to local stderr. No decoration by default. This keeps binary output safe.
+CLI writes job output bytes to local stdout with no decoration.
 
 ## Cgroups
 
 Use cgroup v2 only.
 
-Server flag:
-
-```text
---cgroup-root <path>
-```
-
 Layout:
 
 ```text
-<cgroup-root>/
+/sys/fs/cgroup/jobworker/
   supervisor/
   job-<id>/
 ```
 
-The worker keeps `<cgroup-root>` as a parent-only cgroup. During startup, the worker creates `<cgroup-root>/supervisor` and moves its own process there before enabling controllers, unless the service manager already placed it in a child cgroup.
+The worker keeps `/sys/fs/cgroup/jobworker` as a parent-only cgroup. During startup, the worker creates `/sys/fs/cgroup/jobworker/supervisor` and moves its own process there before enabling controllers, unless the service manager already placed it in a child cgroup.
 
 Startup checks:
 
 ```text
 cgroup v2 exists
-root is writable
+jobworker cgroup root is writable
 cpu controller exists
 memory controller exists
 io controller exists
+cgroup.kill exists
 child cgroups can be created
 ```
 
 Initialization:
 
-1. Read `<cgroup-root>/cgroup.controllers`.
+1. Read `/sys/fs/cgroup/jobworker/cgroup.controllers`.
 2. Require `cpu`, `memory`, and `io`.
-3. Move worker process into `<cgroup-root>/supervisor/cgroup.procs` if needed.
-4. Write `+cpu +memory +io` to `<cgroup-root>/cgroup.subtree_control`.
+3. Move worker process into `/sys/fs/cgroup/jobworker/supervisor/cgroup.procs` if needed.
+4. Write `+cpu +memory +io` to `/sys/fs/cgroup/jobworker/cgroup.subtree_control`.
 5. Create one child cgroup per job.
 
 Per-job files:
@@ -303,7 +275,6 @@ Per-job files:
 cpu.max       CPU limit
 memory.max    memory limit
 io.max        disk I/O limit
-cgroup.procs  attach process, fallback only
 cgroup.kill   kill remaining processes
 ```
 
@@ -378,14 +349,11 @@ message GetJobResponse {
 
 message StreamOutputRequest {
   string job_id = 1;
-  bool follow = 2;
 }
 
 message OutputChunk {
-  OutputStream stream = 1;
-  bytes data = 2;
-  bool eof = 3;
-  bool truncated = 4;
+  bytes data = 1;
+  bool eof = 2;
 }
 
 message Job {
@@ -396,11 +364,9 @@ message Job {
   ResourceLimits limits = 5;
   JobState state = 6;
   int32 pid = 7;
-  int32 process_group_id = 8;
-  string cgroup_path = 9;
-  ExitResult exit = 10;
-  bool output_truncated = 11;
-  string output_error = 12;
+  string cgroup_path = 8;
+  ExitResult exit = 9;
+  string output_error = 10;
 }
 
 message ResourceLimits {
@@ -426,11 +392,6 @@ enum JobState {
   JOB_STATE_FAILED = 6;
 }
 
-enum OutputStream {
-  OUTPUT_STREAM_UNSPECIFIED = 0;
-  OUTPUT_STREAM_STDOUT = 1;
-  OUTPUT_STREAM_STDERR = 2;
-}
 ```
 
 `job_id` is an opaque server-generated UUID string. Clients pass it back unchanged and do not parse meaning from it.
@@ -459,27 +420,21 @@ Demo cert setup:
 ```text
 CA cert:       local demo CA
 server cert:   serverAuth EKU, DNS/IP SAN for localhost dev
-client certs:  clientAuth EKU, URI SAN identity
-key type:      ECDSA P-256 or Ed25519
+client certs:  clientAuth EKU, Common Name identity
+key type:      Ed25519
 ```
 
 No bearer token. No password. No custom auth header.
 
-### URI SAN identity and roles
+### Client identity and roles
 
-Client identity comes from the verified client certificate URI SAN. Common Name is ignored.
-
-URI SAN format:
-
-```text
-spiffe://jobworker.local/user/<name>
-```
+Client identity comes from the verified client certificate Common Name.
 
 Hardcoded role map:
 
 ```text
-spiffe://jobworker.local/user/admin   -> admin
-spiffe://jobworker.local/user/runner  -> runner
+admin   -> admin
+runner  -> runner
 ```
 
 Policy:
@@ -489,9 +444,9 @@ admin   all jobs, all actions
 runner  start jobs, read own jobs, stop own jobs
 ```
 
-Job owner is set from client identity at start time. Unknown URI SANs are rejected.
+Job owner is set from client identity at start time. Unknown client identities are rejected.
 
-Authorization is implemented in the gRPC layer. A unary interceptor and stream interceptor extract the verified client certificate from the TLS connection, read its URI SAN identity, map that identity to a role, and attach the authenticated principal to the RPC context. Each handler then checks the requested action against the role policy and, for existing jobs, the job owner before calling the worker library.
+Authorization is implemented in the gRPC layer. A unary interceptor and stream interceptor extract the verified client certificate from the TLS connection, read its Common Name, map that identity to a role, and attach the authenticated principal to the RPC context. Each handler then checks the requested action against the role policy and, for existing jobs, the job owner before calling the worker library.
 
 `StartJob` requires `runner` or `admin`. `GetJob`, `StopJob`, and `StreamOutput` require either `admin` or a matching job owner.
 
@@ -501,7 +456,6 @@ Start server:
 
 ```bash
 jobworker server --listen 127.0.0.1:8443 \
-  --cgroup-root /sys/fs/cgroup/jobworker \
   --ca testdata/certs/ca.pem \
   --cert testdata/certs/server.pem \
   --key testdata/certs/server-key.pem
@@ -524,11 +478,10 @@ Other commands:
 ```bash
 jobctl status <job-id>
 jobctl output <job-id>
-jobctl output --follow <job-id>
 jobctl stop <job-id>
 ```
 
-CLI output is raw by default. It writes job stdout bytes to local stdout and job stderr bytes to local stderr.
+CLI output is raw by default. It writes combined job output bytes to local stdout.
 
 ## Security notes
 
@@ -548,13 +501,13 @@ Focus tests on risky parts.
 
 Worker/process tests: valid start, bad path, missing command, server-owned working directory, stop running job, stop exited job, child process cleanup, exit status, start rollback.
 
-Output tests: replay from start, follow mode, EOF, multiple clients, stdout/stderr separation, binary data, invalid UTF-8, NUL bytes, cancellation, truncation, stream error.
+Output tests: replay from start, stream until EOF, multiple clients, combined stdout/stderr ordering, binary data, invalid UTF-8, NUL bytes, cancellation, stream error.
 
-TLS/auth tests: valid cert, missing cert, unknown CA, missing URI SAN, unknown URI SAN, unauthorized role, owner checks, admin override.
+TLS/auth tests: valid cert, missing cert, unknown CA, missing Common Name, unknown identity, unauthorized role, owner checks, admin override.
 
-Cgroup tests: create job cgroup, write `cpu.max`, write `memory.max`, write `io.max`, enable `cgroup.subtree_control`, direct cgroup placement, cleanup, missing controller error.
+Cgroup tests: create job cgroup, write `cpu.max`, write `memory.max`, write `io.max`, enable `cgroup.subtree_control`, direct cgroup placement, `cgroup.kill` cleanup, missing controller error.
 
-Most cgroup tests use a fake cgroup filesystem. Real cgroup tests are gated:
+Unit tests use temporary directories to verify cgroup file writes and error handling. A gated real cgroup v2 integration test verifies direct placement, resource-limit writes, `cgroup.kill`, and cleanup:
 
 ```bash
 JOBWORKER_CGROUP_INTEGRATION=1 go test ./pkg/cgroup -run Integration
@@ -564,8 +517,8 @@ Run with the race detector.
 
 ## PR plan
 
-1. Worker library: job model, start, stop, status.
-2. Output streaming: spool, replay, follow, multiple clients.
-3. gRPC, mTLS, authz, CLI.
-4. cgroup v2 limits and process cleanup.
-5. Polish: tests, docs.
+1. Worker library with tests: job model, start, stop, status.
+2. Output streaming with tests: spool, replay, terminal-like combined output, multiple clients.
+3. gRPC, mTLS, authz, and CLI with tests.
+4. Cgroup v2 limits and process cleanup with tests.
+5. Final docs cleanup.
