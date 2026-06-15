@@ -318,7 +318,7 @@ io_read_bps/io_write_bps -> io.max = "<major>:<minor> rbps=<n> wbps=<n>"
 io unset                 -> no io.max write
 ```
 
-CPU is millicores. Memory is bytes. Disk I/O is read/write bytes per second.
+CPU is millicores. Memory is bytes. Disk I/O is read/write bytes per second. Limits are optional unsigned values. Omitted means no limit; zero is invalid when present.
 
 ### Disk I/O device resolution
 
@@ -404,10 +404,10 @@ message Job {
 }
 
 message ResourceLimits {
-  int64 cpu_millicores = 1;
-  int64 memory_bytes = 2;
-  int64 io_read_bps = 3;
-  int64 io_write_bps = 4;
+  optional uint64 cpu_millicores = 1;
+  optional uint64 memory_bytes = 2;
+  optional uint64 io_read_bps = 3;
+  optional uint64 io_write_bps = 4;
 }
 
 message ExitResult {
