@@ -82,7 +82,7 @@ owner identity
 executable path
 args
 server-owned working directory
-limits
+applied resource limits
 state
 pid
 cgroup path
@@ -90,6 +90,8 @@ exit result
 output spool path
 output error state
 ```
+
+Job IDs are generated with `github.com/google/uuid` using `uuid.NewString()`.
 
 States:
 
@@ -102,18 +104,42 @@ KILLED
 FAILED
 ```
 
+`EXITED` means the process started and then exited on its own, including non-zero exit codes. `KILLED` means the worker stopped the job with `cgroup.kill`. `FAILED` means the worker hit an internal lifecycle error, such as a wait, output, or cgroup cleanup error. A command returning exit code 1 is still `EXITED`, not `FAILED`.
+
 Job metadata is in memory. Completed jobs remain queryable until server shutdown.
 
 ## Worker API
 
 ```go
+type JobID string
+
+type StartSpec struct {
+    Owner string
+    Path  string
+    Args  []string
+}
+
+type ResourceLimits struct {
+    CPUMillicores uint64
+    MemoryBytes   uint64
+    IOReadBPS     uint64
+    IOWriteBPS    uint64
+}
+
+type OutputChunk struct {
+    Data []byte
+    EOF  bool
+}
+
 type Worker interface {
     Start(ctx context.Context, spec StartSpec) (*Job, error)
-    Stop(ctx context.Context, id JobID, opts StopOptions) (*Job, error)
+    Stop(ctx context.Context, id JobID) (*Job, error)
     Get(ctx context.Context, id JobID) (*Job, error)
-    StreamOutput(ctx context.Context, id JobID, opts StreamOptions) (<-chan OutputChunk, error)
+    StreamOutput(ctx context.Context, id JobID) (<-chan OutputChunk, error)
 }
 ```
+
+The worker applies one fixed `ResourceLimits` value to every job for the prototype. Clients do not set per-job limits.
 
 Use locks for shared state. Do not hold locks while doing process waits, file I/O, or gRPC sends.
 
@@ -124,7 +150,7 @@ Start flow:
 1. Validate request.
 2. Require absolute executable path.
 3. Reject shell strings and `PATH` lookup.
-4. Validate resource limits.
+4. Load fixed resource limits.
 5. Create an opaque UUID job ID.
 6. Create output spool files.
 7. Create job cgroup.
@@ -212,13 +238,13 @@ output.bin
 
 The process stdout and stderr file descriptors both write to the same pipe. The drain goroutine reads that pipe as bytes and appends to the spool file. This preserves the output ordering seen by the worker instead of separating streams and reordering them later.
 
-New output wakes waiting clients with a condition variable or broadcaster channel. No busy polling.
+New output wakes waiting clients with a `sync.Cond`. The drain goroutine appends bytes to `output.bin`, updates the current size under the output lock, and calls `Broadcast`. Stream clients keep their own read offset and wait on the condition variable when their offset has caught up and the stream has not reached EOF or an error.
 
 Multiple clients can stream the same job. Each client has its own internal read position.
 
 Output chunks are bounded, for example 32 KiB or 64 KiB, to avoid huge gRPC messages.
 
-If output read/spool fails, the job records `output_error`, waiting stream clients receive a gRPC error, and status remains queryable.
+If output read/spool fails, the job records `output_error` on the in-memory job record. `GetJob` and `StopJob` return that field in job status, waiting stream clients receive a gRPC error, and status remains queryable.
 
 ### EOF and ordering
 
@@ -281,15 +307,12 @@ cgroup.kill   kill remaining processes
 Limit mapping:
 
 ```text
-cpu_millicores=500       -> cpu.max = "50000 100000"
-cpu unset                -> cpu.max = "max 100000"
-memory_bytes=134217728   -> memory.max = "134217728"
-memory unset             -> memory.max = "max"
-io_read_bps/io_write_bps -> io.max = "<major>:<minor> rbps=<n> wbps=<n>"
-io unset                 -> no io.max write
+cpu_millicores=500              -> cpu.max = "50000 100000"
+memory_bytes=134217728          -> memory.max = "134217728"
+io_read_bps/io_write_bps values -> io.max = "<major>:<minor> rbps=<n> wbps=<n>"
 ```
 
-CPU is millicores. Memory is bytes. Disk I/O is read/write bytes per second. Limits are optional unsigned values. Omitted means no limit; zero is invalid when present.
+CPU is millicores. Memory is bytes. Disk I/O is read/write bytes per second. The prototype uses one fixed set of unsigned non-zero limits for every job.
 
 ### Disk I/O device resolution
 
@@ -303,7 +326,7 @@ Disk I/O uses cgroup v2 `io.max`.
 4. Use that mount's major:minor device number.
 5. Write `io.max` for that device.
 
-If I/O limits are requested and the device cannot be resolved, or the `io.max` write fails, `Start` fails. If no I/O limits are requested, the worker skips `io.max`.
+If the disk I/O device cannot be resolved, or the `io.max` write fails, `Start` fails.
 
 This is not perfect for every filesystem. `tmpfs`, network filesystems, overlay filesystems, loop devices, and device mapper can behave differently. That limitation is documented.
 
@@ -324,7 +347,6 @@ service WorkerService {
 message StartJobRequest {
   string path = 1;
   repeated string args = 2;
-  ResourceLimits limits = 3;
 }
 
 message StartJobResponse {
@@ -370,10 +392,10 @@ message Job {
 }
 
 message ResourceLimits {
-  optional uint64 cpu_millicores = 1;
-  optional uint64 memory_bytes = 2;
-  optional uint64 io_read_bps = 3;
-  optional uint64 io_write_bps = 4;
+  uint64 cpu_millicores = 1;
+  uint64 memory_bytes = 2;
+  uint64 io_read_bps = 3;
+  uint64 io_write_bps = 4;
 }
 
 message ExitResult {
@@ -396,7 +418,7 @@ enum JobState {
 
 `job_id` is an opaque server-generated UUID string. Clients pass it back unchanged and do not parse meaning from it.
 
-`StartJobRequest` does not include `cwd`. The server chooses the working directory.
+`StartJobRequest` does not include `cwd` or resource limits. The server chooses the working directory and applies fixed limits.
 
 Skip `ListJobs` for the first version.
 
@@ -446,9 +468,11 @@ runner  start jobs, read own jobs, stop own jobs
 
 Job owner is set from client identity at start time. Unknown client identities are rejected.
 
-Authorization is implemented in the gRPC layer. A unary interceptor and stream interceptor extract the verified client certificate from the TLS connection, read its Common Name, map that identity to a role, and attach the authenticated principal to the RPC context. Each handler then checks the requested action against the role policy and, for existing jobs, the job owner before calling the worker library.
+Authorization is implemented in the gRPC layer. A unary interceptor and stream interceptor extract the verified client certificate from the TLS connection, read its Common Name, map that identity to a role, and attach the authenticated principal to the RPC context. Each handler then checks the requested action against the role policy and, for existing jobs, the job owner before calling the worker library. A matching owner without a known role is rejected.
 
-`StartJob` requires `runner` or `admin`. `GetJob`, `StopJob`, and `StreamOutput` require either `admin` or a matching job owner.
+`StartJob` requires `runner` or `admin`. `GetJob`, `StopJob`, and `StreamOutput` require either `admin` or `runner` with a matching job owner.
+
+For the prototype, roles live in a hardcoded server-side map. Encoding roles in certificate fields or using separate issuing CAs would work, but that adds certificate lifecycle scope.
 
 ## CLI UX
 
@@ -468,8 +492,6 @@ jobctl start --addr 127.0.0.1:8443 \
   --ca testdata/certs/ca.pem \
   --cert testdata/certs/runner.pem \
   --key testdata/certs/runner-key.pem \
-  --cpu 500m --memory 128Mi \
-  --read-bps 10485760 --write-bps 10485760 \
   -- /usr/bin/echo hello
 ```
 
