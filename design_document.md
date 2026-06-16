@@ -14,7 +14,7 @@ Target is Level 5. That means:
 - simple authz
 - output streaming
 - process-tree cleanup
-- per-job CPU, memory, and disk I/O limits with cgroup v2
+- fixed CPU, memory, and disk I/O limits with cgroup v2
 
 This is a prototype. Keepin' it small. No scheduler. No database. No containers. No full platform.
 
@@ -104,7 +104,7 @@ KILLED
 FAILED
 ```
 
-`EXITED` means the process started and then exited on its own, including non-zero exit codes. `KILLED` means the worker stopped the job with `cgroup.kill`. `FAILED` means the worker hit an internal lifecycle error, such as a wait, output, or cgroup cleanup error. A command returning exit code 1 is still `EXITED`, not `FAILED`.
+`EXITED` means the process started and then exited on its own, including non-zero exit codes. `KILLED` means the worker stopped the job with `cgroup.kill`. `FAILED` means the worker hit an internal lifecycle error, such as a non-exit-result wait error, output failure, or cgroup cleanup error. A command returning exit code 1 is still `EXITED`, not `FAILED`.
 
 Job metadata is in memory. Completed jobs remain queryable until server shutdown.
 
@@ -237,6 +237,8 @@ output.bin
 ```
 
 The process stdout and stderr file descriptors both write to the same pipe. The drain goroutine reads that pipe as bytes and appends to the spool file. This preserves the output ordering seen by the worker instead of separating streams and reordering them later.
+
+A dedicated drain goroutine reads while the process is running so the child does not block if the pipe buffer fills; the wait goroutine only waits for process exit.
 
 New output wakes waiting clients with a `sync.Cond`. The drain goroutine appends bytes to `output.bin`, updates the current size under the output lock, and calls `Broadcast`. Stream clients keep their own read offset and wait on the condition variable when their offset has caught up and the stream has not reached EOF or an error.
 
