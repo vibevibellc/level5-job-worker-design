@@ -82,7 +82,6 @@ owner identity
 executable path
 args
 server-owned working directory
-applied resource limits
 state
 pid
 cgroup path
@@ -385,19 +384,11 @@ message Job {
   string owner = 2;
   string path = 3;
   repeated string args = 4;
-  ResourceLimits limits = 5;
-  JobState state = 6;
-  int32 pid = 7;
-  string cgroup_path = 8;
-  ExitResult exit = 9;
-  string output_error = 10;
-}
-
-message ResourceLimits {
-  uint64 cpu_millicores = 1;
-  uint64 memory_bytes = 2;
-  uint64 io_read_bps = 3;
-  uint64 io_write_bps = 4;
+  JobState state = 5;
+  int32 pid = 6;
+  string cgroup_path = 7;
+  ExitResult exit = 8;
+  string output_error = 9;
 }
 
 message ExitResult {
